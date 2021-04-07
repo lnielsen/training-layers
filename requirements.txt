@@ -1,0 +1,3 @@
+flask-resources==0.7.1
+invenio-records-resources[elasticsearch7,postgresql]==0.14.1
+docker-services-cli==0.3.0
