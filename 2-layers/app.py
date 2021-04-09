@@ -43,6 +43,7 @@ from flask_resources import (HTTPJSONException, JSONDeserializer,
                              request_parser, resource_requestctx,
                              response_handler, route)
 from invenio_records_permissions.generators import AuthenticatedUser, Generator
+from invenio_records_resources.pagination import Pagination
 from invenio_records_resources.services import (Link, LinksTemplate, Service,
                                                 ServiceConfig)
 
@@ -69,6 +70,11 @@ class TodoDatabase:
             raise NoResultError(id_)
         return cls.db[id_]
 
+    @classmethod
+    def get_all(cls, user_id):
+        for item in cls.db.values():
+            if item.user_id == user_id:
+                yield item
 
 class TodoItem:
     def __init__(self, id_, title, priority, user_id):
@@ -127,6 +133,21 @@ class TodoService(Service):
         # Return the wrapped item.
         return self.result_item(item, identity, self.config.links_item)
 
+    def search(self, identity, page=1, size=10):
+        self.require_permission(identity, "search")
+
+        item_list = TodoDatabase.get_all(identity.id)
+
+        return self.result_list(
+            list(item_list),
+            identity,
+            {"page": page, "size": size},
+            self.config.links_search,
+            self.config.result_item_cls,
+            self.config.links_item
+        )
+
+
 
 class TodoItemResult:
     def __init__(self, item, identity, links_tpl):
@@ -142,6 +163,49 @@ class TodoItemResult:
             "is_owner": self._identity.id == self._item.user_id,
             # Links are injected with URI templates (see config below)
             "links": LinksTemplate(self._links_tpl).expand(self._item)
+        }
+
+
+class TodoListResult:
+    def __init__(self, item_list, identity, params, links_tpl, item_result_cls,
+                 links_item_tpl):
+        self._identity = identity
+        self._item_list = item_list
+        self._item_result_cls = item_result_cls
+        self._links_item_tpl = links_item_tpl
+        self._links_tpl = links_tpl
+        self._params = params
+
+    def to_dict(self):
+        # Create pagination
+        total = len(self._item_list)
+
+        pagination = Pagination(
+            self._params["size"],
+            self._params["page"],
+            total,
+        )
+
+        # Dump each item and slice list to pagination window
+        hits = []
+        for item in self._item_list[pagination.from_idx:pagination.to_idx]:
+            item = self._item_result_cls(
+                item,
+                self._identity,
+                self._links_item_tpl,
+            )
+            hits.append(item.to_dict())
+
+        # Dump full list
+        return {
+            "hits": {
+                "hits": hits,
+                "total": total,
+            },
+            "links": LinksTemplate(
+                self._links_tpl,
+                context={"args": self._params}
+            ).expand(pagination)
         }
 
 
@@ -168,7 +232,7 @@ user_request_parser = request_parser(
     location='args',
     # Below defines what to do with unknown values (passed to marshmallow
     # schema). Either ma.EXCLUDE, ma.INCLUDE or ma.RAISE
-    unknown=ma.RAISE,
+    unknown=ma.EXCLUDE,
 )
 
 class TodoResource(Resource):
@@ -211,6 +275,7 @@ class TodoResource(Resource):
             #   request context<<. More on that below.
             # You are not required to use the "route()".
             route("POST", "", self.create),
+            route("GET", "", self.search),
             route("GET", "/<item_id>", self.read),
         ]
 
@@ -287,6 +352,37 @@ class TodoResource(Resource):
 
         return item.to_dict(), 200
 
+    @user_request_parser
+    @request_parser(
+        {
+            'page': ma.fields.Int(
+                missing=1,
+                validate=ma.validate.Range(min=1),
+            ),
+            'size': ma.fields.Int(
+                missing=10,
+                validate=ma.validate.Range(min=1)
+            ),
+        },
+        location='args',
+        unknown=ma.EXCLUDE,
+    )
+    # When return a list results, we add the "many=True". This is because the
+    # serializer may need special handling for lists - e.g. enveloping the
+    # results. For the default JSONSerializer which we use in this example,
+    # there's no difference be between many=True/many=False.
+    @response_handler(many=True)
+    def search(self):
+        identity = self._make_identity(resource_requestctx.args['user'])
+
+        item_list = self.service.search(
+            identity,
+            page=resource_requestctx.args['page'],
+            size=resource_requestctx.args['size'],
+        )
+
+        return item_list.to_dict(), 200
+
 
 # This is the end of the three layers - presentation, service and data.
 # =============================================================================
@@ -330,6 +426,8 @@ class TodoPermissionPolicy(Permission):
     # The "can_read" requires that the user reading the object is the one who
     # created it.
     can_read = [Owner()]
+    # Anyone can search
+    can_search = []
 
 
 #
@@ -351,6 +449,7 @@ class TodoSchema(ma.Schema):
 class TodoServiceConfig(ServiceConfig):
     permission_policy_cls = TodoPermissionPolicy
     result_item_cls = TodoItemResult
+    result_list_cls = TodoListResult
     todo_item_cls = TodoItem
     schema_cls = TodoSchema
 
@@ -363,6 +462,24 @@ class TodoServiceConfig(ServiceConfig):
             "{+api}/todos/{id}",
             vars=lambda item, vars: vars.update({"id": item.id})
         )
+    }
+
+    links_search = {
+        "prev": Link(
+            "{+api}/todos{?args*}",
+            when=lambda pagination, ctx: pagination.has_prev,
+            vars=lambda pagination, vars: vars["args"].update({
+                "page": pagination.prev_page.page
+            })
+        ),
+        "self": Link("{+api}/todos{?args*}"),
+        "next": Link(
+            "{+api}/todos{?args*}",
+            when=lambda pagination, ctx: pagination.has_next,
+            vars=lambda pagination, vars: vars["args"].update({
+                "page": pagination.next_page.page
+            })
+        ),
     }
 
 
